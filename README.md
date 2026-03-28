@@ -1,5 +1,7 @@
 # Membox: Weaving Topic Continuity into Long-Range Memory for LLM Agents
 
+[中文详细使用说明 / Chinese Usage Guide](docs/usage_zh.md)
+
 ## Introduction
 
 MemBox is a memory architecture designed for AI agents, inspired by the continuity and hierarchical structure of human memory. Existing approaches often fragment interaction streams into isolated text chunks for storage and then rely on embedding-based retrieval to reconstruct coherence—a process that inevitably breaks narrative and logical continuity. In contrast, MemBox places topic continuity​ at its core, employing a two-tier architecture—Topic Loom​ and Trace Weaver—to preserve temporal, causal, and thematic structures directly during memory formation.
