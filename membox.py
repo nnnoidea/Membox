@@ -1,9 +1,11 @@
 import argparse
+import hashlib
 import json
 import os
 import logging
 import csv
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
@@ -15,11 +17,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # ================= 1. 全局配置 =================
 class Config:
-    API_KEY = ""
-    BASE_URL = ""
+    API_KEY = "YOUR_API_KEY_HERE"
+    BASE_URL = "https://api.openai.com/v1"
 
-    RAW_DATA_FILE = ""
-    OUTPUT_BASE_DIR = ""
+    RAW_DATA_FILE = "./locomo10.json"
+    OUTPUT_BASE_DIR = "./specific_event_chain_outputs"
     RUN_ID: str | None = None
 
     # 路径会在 apply_run_id 时按 run_id 重写
@@ -29,12 +31,15 @@ class Config:
     SIMPLE_RETRIEVAL_JSONL = os.path.join(OUTPUT_DIR, "simple_retrieval.jsonl")
     SIMPLE_RETRIEVAL_CSV = os.path.join(OUTPUT_DIR, "simple_retrieval.csv")
     GENERATION_RESULT_FILE = os.path.join(OUTPUT_DIR, "generation_results.jsonl")
-    GENERATION_REPORT_CSV = os.path.join(OUTPUT_DIR, "report_generation_qa.csv")
     TOKEN_LOG_FILE = os.path.join(OUTPUT_DIR, "token_stream.jsonl")
     BUILD_TRACE_FILE = os.path.join(OUTPUT_DIR, "trace_build_process.jsonl")
     TIME_TRACE_FILE = os.path.join(OUTPUT_DIR, "time_traces.jsonl")
     TRACE_PROMPT_LOG_FILE = os.path.join(OUTPUT_DIR, "trace_prompts.jsonl")
     TRACE_STATS_FILE = os.path.join(OUTPUT_DIR, "trace_stats.jsonl")
+    API_RETRY_LOG_FILE = os.path.join(OUTPUT_DIR, "api_retries.jsonl")
+
+    API_TIMEOUT_SECONDS = 15.0
+    API_MAX_RETRIES = 2
 
     LIMIT_CONVERSATIONS = 10
     LIMIT_SESSIONS = None  # None 表示不限制
@@ -48,10 +53,12 @@ class Config:
 
     # 生成阶段使用的 box 数量（答案上下文 TopN）
     ANSWER_TOP_N = 5
+    # trace 上下文使用的 seed events 数量；all 等价于按 box 找全部所在 traces
+    TRACE_EVENT_TOP_N = "all"
     # 默认仅运行 content 文本模式，按需开启 trace 模式
     GEN_TEXT_MODES = ["content_trace_event"]
 
-    LLM_MODEL = "gpt-4o-mini"
+    LLM_MODEL = "gpt-4o"
     EMBEDDING_MODEL = "text-embedding-3-small"
 
     # --- 提示词 ---
@@ -90,6 +97,9 @@ Answer:"""
 }}
 Content to analyze: {text}"""
 
+    PROMPT_TOPIC_FALLBACK = "Summarize the main topic in one short phrase: {text}"
+    PROMPT_CONTEXT_FALLBACK = "Generate a concise 2-3 sentence context summary: {text}"
+    PROMPT_KEYWORD_FALLBACK = "Extract 3-8 salient keywords as a comma-separated list: {text}"
 
     
 
@@ -275,13 +285,13 @@ Answer:"""
         cls.SIMPLE_RETRIEVAL_JSONL = os.path.join(cls.OUTPUT_DIR, "simple_retrieval.jsonl")
         cls.SIMPLE_RETRIEVAL_CSV = os.path.join(cls.OUTPUT_DIR, "simple_retrieval.csv")
         cls.GENERATION_RESULT_FILE = os.path.join(cls.OUTPUT_DIR, "generation_results.jsonl")
-        cls.GENERATION_REPORT_CSV = os.path.join(cls.OUTPUT_DIR, "report_generation_qa.csv")
         cls.TOKEN_LOG_FILE = os.path.join(cls.OUTPUT_DIR, "token_stream.jsonl")
         cls.BUILD_TRACE_FILE = os.path.join(cls.OUTPUT_DIR, "trace_build_process.jsonl")
         cls.TIME_TRACE_FILE = os.path.join(cls.OUTPUT_DIR, "time_traces.jsonl")
         cls.TRACE_PROMPT_LOG_FILE = os.path.join(cls.OUTPUT_DIR, "trace_prompts.jsonl")
         cls.BUILD_STATS_FILE = os.path.join(cls.OUTPUT_DIR, "build_stats.jsonl")
         cls.GEN_SUMMARY_FILE = os.path.join(cls.OUTPUT_DIR, "generation_metrics_summary.jsonl")
+        cls.API_RETRY_LOG_FILE = os.path.join(cls.OUTPUT_DIR, "api_retries.jsonl")
         os.makedirs(cls.OUTPUT_DIR, exist_ok=True)
         os.makedirs(cls.VECTOR_DIR, exist_ok=True)
 
@@ -414,18 +424,68 @@ class EmbeddingStore:
 
 class LLMWorker:
     def __init__(self):
-        self.client = OpenAI(base_url=Config.BASE_URL, api_key=Config.API_KEY)
+        self.client = OpenAI(
+            base_url=Config.BASE_URL,
+            api_key=Config.API_KEY,
+            timeout=Config.API_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
         self.encoding = tiktoken.encoding_for_model(Config.LLM_MODEL)
 
     def count_tokens(self, text: str) -> int:
         return len(self.encoding.encode(text or ""))
 
+    def _log_api_retry(self, kind: str, note: str, attempt: int, elapsed: float, error: Exception, will_retry: bool):
+        entry = {
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "run_id": Config.RUN_ID,
+            "kind": kind,
+            "note": note,
+            "attempt": attempt,
+            "max_retries": Config.API_MAX_RETRIES,
+            "timeout_seconds": Config.API_TIMEOUT_SECONDS,
+            "elapsed_seconds": round(elapsed, 3),
+            "error_type": type(error).__name__,
+            "error": str(error)[:1000],
+            "will_retry": will_retry,
+        }
+        os.makedirs(os.path.dirname(Config.API_RETRY_LOG_FILE), exist_ok=True)
+        with open(Config.API_RETRY_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logger.warning(
+            "⚠️ API %s failed for %s on attempt %s/%s after %.2fs; retry=%s: %s",
+            kind,
+            note,
+            attempt,
+            Config.API_MAX_RETRIES + 1,
+            elapsed,
+            will_retry,
+            type(error).__name__,
+        )
+
+    def _call_with_retries(self, kind: str, note: str, fn):
+        for attempt in range(1, Config.API_MAX_RETRIES + 2):
+            start = time.time()
+            try:
+                return fn()
+            except Exception as exc:
+                elapsed = time.time() - start
+                will_retry = attempt <= Config.API_MAX_RETRIES
+                self._log_api_retry(kind, note, attempt, elapsed, exc, will_retry)
+                if not will_retry:
+                    raise
+                time.sleep(min(2.0, 0.5 * attempt))
+
     def get_embedding(self, text, note="Emb"):
         try:
             if not text:
                 return [0.0] * 1536
-            resp = self.client.embeddings.create(
-                input=text.replace("\n", " "), model=Config.EMBEDDING_MODEL
+            resp = self._call_with_retries(
+                "embedding",
+                note,
+                lambda: self.client.embeddings.create(
+                    input=text.replace("\n", " "), model=Config.EMBEDDING_MODEL
+                ),
             )
             emb = None
             try:
@@ -445,7 +505,11 @@ class LLMWorker:
             }
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
-            resp = self.client.chat.completions.create(**kwargs)
+            resp = self._call_with_retries(
+                "chat",
+                note,
+                lambda: self.client.chat.completions.create(**kwargs),
+            )
             extra_payload = {"prompt_tokens_est": self.count_tokens(prompt)}
             if extra:
                 extra_payload.update(extra)
@@ -497,8 +561,19 @@ class TopicClusterManager:
             else:
                 events = []
                 events_text = str(evs).strip()
-        except:
-            print("something wrong")
+        except Exception:
+            topic = self.worker.chat_completion(
+                Config.PROMPT_TOPIC_FALLBACK.format(text=content_str),
+                note=f"{prefix}_AbsTop",
+                extra={"prompt_tokens_est": self.worker.count_tokens(content_str), "stage": "build"},
+            )
+            keywords_txt = self.worker.chat_completion(
+                Config.PROMPT_KEYWORD_FALLBACK.format(text=content_str),
+                note=f"{prefix}_KW",
+                extra={"prompt_tokens_est": self.worker.count_tokens(content_str), "stage": "build"},
+            )
+            events = []
+            events_text = ""
         topic_kw_text = f"{topic} {keywords_txt}".strip()
 
         new_box["runtime_info"] = {
@@ -1201,6 +1276,7 @@ class AnswerGenerator:
         answer_topn: int | List[int] | None = None,
         text_modes: List[str] | None = None,
         stage_label: str = "gen",
+        trace_event_topn: int | str | None = None,
     ):
         self.worker = worker
         if isinstance(answer_topn, list):
@@ -1209,11 +1285,14 @@ class AnswerGenerator:
             self.answer_topn_list = [answer_topn or Config.ANSWER_TOP_N or Config.TOP_K_RETRIEVE]
         self.text_modes = text_modes or Config.GEN_TEXT_MODES
         self.trace_metrics = Config.TRACE_METRICS
+        self.trace_event_topn = trace_event_topn if trace_event_topn is not None else Config.TRACE_EVENT_TOP_N
         self.encoding = tiktoken.encoding_for_model(Config.LLM_MODEL)
         self.box_map: Dict[int, Dict[int, str]] = {}
+        self.box_events: Dict[int, Dict[int, List[str]]] = {}
         self.qa_map: Dict[int, List[Dict[str, Any]]] = {}
         self.boxes_by_sample: Dict[int, List[Dict[str, Any]]] = {}
         self.trace_map: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+        self.embedding_stores: Dict[int, EmbeddingStore] = {}
         self.content_totals: Dict[int, int] = defaultdict(int)
         self.aggregate: Dict[Tuple[str, str, str, str, int], Dict[str, float]] = defaultdict(lambda: {"f1_sum": 0.0, "bleu_sum": 0.0, "ctx_tokens_sum": 0.0, "count": 0})
         self.aggregate_by_category: Dict[Tuple[str, str, str, str, int, str], Dict[str, float]] = defaultdict(lambda: {"f1_sum": 0.0, "bleu_sum": 0.0, "ctx_tokens_sum": 0.0, "count": 0})
@@ -1282,8 +1361,11 @@ class AnswerGenerator:
                 bid = b.get("box_id")
                 if sid is None or bid is None:
                     continue
-                text = b.get("features", {}).get("content_text", "")
+                features = b.get("features", {})
+                text = features.get("content_text", "")
+                events = [str(e).strip() for e in (features.get("events") or []) if str(e).strip()]
                 self.box_map.setdefault(sid, {})[bid] = text
+                self.box_events.setdefault(sid, {})[bid] = events
                 self.boxes_by_sample.setdefault(sid, []).append({"box_id": bid, "coverage": b.get("coverage", {})})
                 self.content_totals[sid] += len(self.encoding.encode(text))
 
@@ -1308,42 +1390,130 @@ class AnswerGenerator:
                     traces[sid][metric].append(t)
         self.trace_map = traces
 
+    def _embedding_store(self, sid: int) -> EmbeddingStore:
+        if sid not in self.embedding_stores:
+            self.embedding_stores[sid] = EmbeddingStore(self.worker, sid)
+        return self.embedding_stores[sid]
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+    def _trace_event_topn_value(self) -> int | None:
+        value = self.trace_event_topn
+        if value is None:
+            return None
+        if isinstance(value, str) and value.lower() == "all":
+            return None
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return None
+
     def _trace_events_for_box(self, sid: int, bid: int, metric: str) -> List[str]:
         traces = self.trace_map.get(sid, {}).get(metric, [])
+        events_texts: List[str] = []
+        seen_events = set()
         for tr in traces:
             if bid not in tr.get("box_ids", []):
                 continue
-            events_texts: List[str] = []
-            for entry in tr.get("entries", []):
-                evs = entry.get("events") or []
-                if not evs:
+            for event_text in self._trace_event_lines(tr):
+                if event_text in seen_events:
                     continue
-                ts = str(entry.get("start_time", "Unknown"))
-                for ev in evs:
-                    ev_clean = str(ev).strip()
-                    if ev_clean:
-                        events_texts.append(f"{ts}: {ev_clean}")
-            return events_texts
-        return []
+                seen_events.add(event_text)
+                events_texts.append(event_text)
+        return events_texts
 
-    def _build_trace_contexts(self, sid: int, top_ids: List[int], trace_metric: str, mode: str) -> List[str]:
-        contexts: List[str] = []
-        seen_events = set()
+    def _trace_event_lines(self, trace: Dict[str, Any]) -> List[str]:
+        event_lines: List[str] = []
+        for entry in trace.get("entries", []):
+            evs = entry.get("events") or []
+            if not evs:
+                continue
+            ts = str(entry.get("start_time", "Unknown"))
+            for ev in evs:
+                ev_clean = str(ev).strip()
+                if ev_clean:
+                    event_lines.append(f"{ts}: {ev_clean}")
+        return event_lines
+
+    def _select_trace_seed_events(self, sid: int, qid: int, question: str, top_ids: List[int], topn: int) -> set:
+        candidates: List[str] = []
+        seen = set()
         for bid in top_ids:
-            events = self._trace_events_for_box(sid, bid, trace_metric)
-            if not events:
+            for event in self.box_events.get(sid, {}).get(bid, []):
+                if event in seen:
+                    continue
+                seen.add(event)
+                candidates.append(event)
+        if topn >= len(candidates):
+            return set(candidates)
+        if topn <= 0 or not candidates:
+            return set()
+
+        store = self._embedding_store(sid)
+        question_hash = self._hash_text(question)
+        qvec = store.get_vector(f"S{sid}_QA{qid}_{question_hash}_trace_event_question", "question", question, note=f"S{sid}_QA{qid}_TraceEventQ", stage="gen")
+        scored = []
+        for event in candidates:
+            event_hash = self._hash_text(event)
+            evec = store.get_vector(f"S{sid}_Event_{event_hash}", "trace_event", event, note=f"S{sid}_TraceEvent_{event_hash}", stage="gen")
+            try:
+                score = cosine_similarity([qvec], [evec])[0][0] if qvec and evec else -1.0
+            except Exception:
+                score = -1.0
+            scored.append((score, event))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return {event for _, event in scored[:topn]}
+
+    def _trace_events_for_selected_events(self, sid: int, selected_events: set, metric: str) -> List[str]:
+        event_lines: List[str] = []
+        seen_lines = set()
+        if not selected_events:
+            return event_lines
+        traces = self.trace_map.get(sid, {}).get(metric, [])
+        for trace in traces:
+            trace_has_selected_event = False
+            for entry in trace.get("entries", []):
+                if any(str(ev).strip() in selected_events for ev in (entry.get("events") or [])):
+                    trace_has_selected_event = True
+                    break
+            if not trace_has_selected_event:
                 continue
-            events_text = "\n".join(events)
-            if events_text in seen_events:
-                continue
-            seen_events.add(events_text)
+            for event_text in self._trace_event_lines(trace):
+                if event_text in seen_lines:
+                    continue
+                seen_lines.add(event_text)
+                event_lines.append(event_text)
+        return event_lines
+
+    def _build_trace_contexts(self, sid: int, qid: int, question: str, top_ids: List[int], trace_metric: str, mode: str) -> List[str]:
+        contents: List[str] = []
+        for bid in top_ids:
             if mode == "content_trace_event":
                 content = self.box_map.get(sid, {}).get(bid)
-                if not content:
-                    continue
-                contexts.append(f"{content}\nEvents:\n{events_text}")
-            elif mode == "trace_event":
-                contexts.append(f"Events:\n{events_text}")
+                if content:
+                    contents.append(content)
+
+        event_lines: List[str] = []
+        topn_value = self._trace_event_topn_value()
+        if topn_value is None:
+            seen_events = set()
+            for bid in top_ids:
+                for event_text in self._trace_events_for_box(sid, bid, trace_metric):
+                    if event_text in seen_events:
+                        continue
+                    seen_events.add(event_text)
+                    event_lines.append(event_text)
+        else:
+            selected_events = self._select_trace_seed_events(sid, qid, question, top_ids, topn_value)
+            event_lines = self._trace_events_for_selected_events(sid, selected_events, trace_metric)
+
+        contexts: List[str] = []
+        if mode == "content_trace_event":
+            contexts.extend(contents)
+        if event_lines:
+            contexts.append("Events:\n" + "\n".join(event_lines))
         return contexts
 
     def _log_token_counts(self, context_text: str, question: str) -> Dict[str, Any]:
@@ -1352,6 +1522,126 @@ class AnswerGenerator:
             "question_tokens": len(self.encoding.encode(question)),
             "prompt_tokens_est": len(self.encoding.encode(Config.PROMPT_QA_ANSWER.format(memories=context_text, question=question))),
         }
+
+    @staticmethod
+    def _trace_event_topn_label(mode: str, trace_event_topn: Any) -> str:
+        if mode in ("content_trace_event", "trace_event"):
+            return str(trace_event_topn)
+        return ""
+
+    def _generation_key(
+        self,
+        sid: int,
+        qid: int,
+        ranking_strategy: str,
+        metric: str,
+        trace_metric: str | None,
+        mode: str,
+        topn: int,
+    ) -> Tuple[int, int, str, str, str, str, int, str]:
+        return (
+            sid,
+            qid,
+            ranking_strategy,
+            metric,
+            trace_metric or "",
+            mode,
+            int(topn),
+            self._trace_event_topn_label(mode, self.trace_event_topn),
+        )
+
+    @classmethod
+    def _generation_key_from_result(cls, row: Dict[str, Any]) -> Tuple[int, int, str, str, str, str, int, str] | None:
+        try:
+            return (
+                int(row.get("sample_id")),
+                int(row.get("qa_idx")),
+                row.get("ranking_strategy") or "",
+                row.get("metric") or "",
+                row.get("trace_metric") or "",
+                row.get("text_mode") or "",
+                int(row.get("topn")),
+                cls._trace_event_topn_label(row.get("text_mode") or "", row.get("trace_event_topn")),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _load_completed_generation_keys(self, out_jsonl: str) -> set:
+        completed = set()
+        if not os.path.exists(out_jsonl):
+            return completed
+        with open(out_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not str(row.get("pred", "")).strip():
+                    continue
+                key = self._generation_key_from_result(row)
+                if key is not None:
+                    completed.add(key)
+        return completed
+
+    def _seed_current_run_metrics(self, out_jsonl: str) -> Tuple[set, int]:
+        completed = set()
+        seeded_keys = set()
+        if not os.path.exists(out_jsonl):
+            return completed, 0
+
+        text_modes = set(self.text_modes)
+        topn_values = {int(x) for x in self.answer_topn_list}
+        current_trace_label = str(self.trace_event_topn)
+        seeded = 0
+
+        with open(out_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not str(row.get("pred", "")).strip():
+                    continue
+
+                key = self._generation_key_from_result(row)
+                if key is None:
+                    continue
+                completed.add(key)
+
+                _, _, ranking_strategy, metric, trace_metric, mode, topn, trace_label = key
+                if mode not in text_modes or topn not in topn_values:
+                    continue
+                if mode in ("content_trace_event", "trace_event") and trace_label != current_trace_label:
+                    continue
+                if key in seeded_keys:
+                    continue
+
+                try:
+                    f1 = float(row.get("f1", 0) or 0)
+                    bleu = float(row.get("bleu", 0) or 0)
+                    ctx_tokens = int(row.get("context_tokens", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                self._record_metrics(
+                    ranking_strategy,
+                    metric,
+                    trace_metric,
+                    mode,
+                    topn,
+                    f1,
+                    bleu,
+                    ctx_tokens,
+                    int(row.get("sample_id")),
+                    row.get("category"),
+                )
+                seeded_keys.add(key)
+                seeded += 1
+
+        return completed, seeded
 
     def _record_metrics(self, ranking_strategy: str, metric: str, trace_metric: str | None, mode: str, topn: int, f1: float, bleu: float, ctx_tokens: int, sid: int, category: Any):
         key = (ranking_strategy, metric, trace_metric or "", mode, topn)
@@ -1394,6 +1684,7 @@ class AnswerGenerator:
                     "trace_metric": trace_metric,
                     "text_mode": mode,
                     "topn": topn,
+                    "trace_event_topn": self.trace_event_topn,
                     "avg_f1": round(v.get("f1_sum", 0) / count, 4),
                     "avg_bleu": round(v.get("bleu_sum", 0) / count, 4),
                     "avg_context_tokens": round(v.get("ctx_tokens_sum", 0) / count, 2),
@@ -1412,6 +1703,7 @@ class AnswerGenerator:
                     "trace_metric": trace_metric,
                     "text_mode": mode,
                     "topn": topn,
+                    "trace_event_topn": self.trace_event_topn,
                     "category": category,
                     "avg_f1": round(v.get("f1_sum", 0) / count, 4),
                     "avg_bleu": round(v.get("bleu_sum", 0) / count, 4),
@@ -1431,6 +1723,7 @@ class AnswerGenerator:
                     "stage": self.stage_label,
                     "ranking_strategy": ranking_strategy,
                     "sample_id": sid,
+                    "trace_event_topn": self.trace_event_topn,
                     "avg_context_tokens": round(avg_ctx, 2),
                     "content_tokens_total": content_total,
                     "avg_context_ratio_over_content": round(avg_ctx / max(content_total, 1), 4),
@@ -1450,6 +1743,7 @@ class AnswerGenerator:
                     "ranking_strategy": ranking_strategy,
                     "sample_id": sid,
                     "text_mode": mode,
+                    "trace_event_topn": self.trace_event_topn,
                     "avg_context_tokens": round(avg_ctx, 2),
                     "content_tokens_total": content_total,
                     "avg_context_ratio_over_content": round(avg_ctx / max(content_total, 1), 4),
@@ -1477,50 +1771,32 @@ class AnswerGenerator:
         gold: Any,
         targets: List[int],
         category: Any,
-        writer: csv.writer,
         out_jsonl: str,
         topn: int,
     ):
         if mode == "content":
             contexts = [self.box_map.get(sid, {}).get(bid) for bid in top_ids if self.box_map.get(sid, {}).get(bid)]
         else:
-            contexts = self._build_trace_contexts(sid, top_ids, trace_metric or "content_event_topic_kw", mode)
+            contexts = self._build_trace_contexts(sid, qid, question, top_ids, trace_metric or "content_event_topic_kw", mode)
         if not contexts:
-            return
+            return False
 
         context_text = "\n\n".join(contexts)
         user_prompt = Config.PROMPT_QA_ANSWER.format(memories=context_text, question=question)
-        note = f"S{sid}_QA_{qid}_{ranking_strategy}_{metric}_top{topn}_{trace_metric or 'content'}_{mode}"
+        trace_top_label = f"_evtop{self.trace_event_topn}" if mode in ("content_trace_event", "trace_event") else ""
+        note = f"S{sid}_QA_{qid}_{ranking_strategy}_{metric}_top{topn}_{trace_metric or 'content'}_{mode}{trace_top_label}"
         token_info = self._log_token_counts(context_text, question)
         ans = self.worker.chat_completion(
             user_prompt,
             note=note,
             extra={**token_info, "stage": f"{self.stage_label}:{ranking_strategy}"},
         )
+        if not str(ans).strip():
+            logger.warning("⚠️ Empty answer skipped for %s", note)
+            return False
         f1 = self._f1(ans, gold)
         bleu = self._bleu(ans, gold)
         ctx_tokens = token_info.get("memories_tokens", 0)
-
-        writer.writerow(
-            [
-                sid,
-                qid,
-                ranking_strategy,
-                question,
-                gold,
-                ans,
-                f"{f1:.4f}",
-                f"{bleu:.4f}",
-                metric,
-                trace_metric or "",
-                mode,
-                topn,
-                top_ids,
-                targets,
-                category,
-                ctx_tokens,
-            ]
-        )
 
         TraceLogger.log(
             out_jsonl,
@@ -1537,6 +1813,7 @@ class AnswerGenerator:
                 "trace_metric": trace_metric,
                 "text_mode": mode,
                 "topn": topn,
+                "trace_event_topn": self.trace_event_topn,
                 "topk": top_ids,
                 "target_boxes": targets,
                 "category": category,
@@ -1544,8 +1821,9 @@ class AnswerGenerator:
             },
         )
         self._record_metrics(ranking_strategy, metric, trace_metric, mode, topn, f1, bleu, ctx_tokens, sid, category)
+        return True
 
-    def run(self, retrieval_jsonl: str, base_out_jsonl: str, base_out_csv: str):
+    def run(self, retrieval_jsonl: str, base_out_jsonl: str):
         if not os.path.exists(retrieval_jsonl):
             logger.error("❌ Retrieval result not found: %s", retrieval_jsonl)
             return
@@ -1554,30 +1832,10 @@ class AnswerGenerator:
         self._load_qa()
         self._load_traces()
 
-        logger.info("ℹ️ Generation text_modes=%s answer_topn=%s", self.text_modes, self.answer_topn_list)
-
-        csv_base_exists = os.path.exists(base_out_csv)
-        csv_base_file = open(base_out_csv, "a", newline="", encoding="utf-8")
-        base_writer = csv.writer(csv_base_file)
-        if not csv_base_exists:
-            base_writer.writerow([
-                "Sample_ID",
-                "QA_ID",
-                "Ranking_Strategy",
-                "Question",
-                "Gold",
-                "Pred",
-                "F1",
-                "BLEU",
-                "Metric",
-                "Trace_Metric",
-                "Text_Mode",
-                "TopN",
-                "TopIDs",
-                "Targets",
-                "Category",
-                "Context_Tokens",
-            ])
+        logger.info("ℹ️ Generation text_modes=%s answer_topn=%s trace_event_topn=%s", self.text_modes, self.answer_topn_list, self.trace_event_topn)
+        completed_keys, seeded_count = self._seed_current_run_metrics(base_out_jsonl)
+        expected_keys = set()
+        logger.info("ℹ️ Resume loaded %s successful generations; seeded %s rows for this run summary", len(completed_keys), seeded_count)
 
         with open(retrieval_jsonl, "r") as f:
             entries = [json.loads(line) for line in f]
@@ -1603,10 +1861,10 @@ class AnswerGenerator:
             if not base_rank:
                 continue
 
-            ranking_sets = [("baseline", base_rank, base_writer, base_out_jsonl)]
+            ranking_sets = [("baseline", base_rank, base_out_jsonl)]
 
-            for ranking_strategy, ranking_list, writer_obj, out_path in ranking_sets:
-                if not writer_obj or not out_path:
+            for ranking_strategy, ranking_list, out_path in ranking_sets:
+                if not out_path:
                     continue
 
                 for topn in self.answer_topn_list:
@@ -1615,7 +1873,11 @@ class AnswerGenerator:
                         continue
 
                     if "content" in self.text_modes:
-                        self._generate_for_ranking(
+                        key = self._generation_key(sid, qid, ranking_strategy, "content_event_topic_kw", None, "content", topn)
+                        expected_keys.add(key)
+                        if key in completed_keys:
+                            continue
+                        if self._generate_for_ranking(
                             ranking_strategy=ranking_strategy,
                             metric="content_event_topic_kw",
                             trace_metric=None,
@@ -1627,15 +1889,19 @@ class AnswerGenerator:
                             gold=gold,
                             targets=targets,
                             category=category,
-                            writer=writer_obj,
                             out_jsonl=out_path,
                             topn=topn,
-                        )
+                        ):
+                            completed_keys.add(key)
 
                     if "content_trace_event" in self.text_modes or "trace_event" in self.text_modes:
                         for trace_metric in self.trace_metrics:
                             for mode in [m for m in self.text_modes if m in ("content_trace_event", "trace_event")]:
-                                self._generate_for_ranking(
+                                key = self._generation_key(sid, qid, ranking_strategy, "content_event_topic_kw", trace_metric, mode, topn)
+                                expected_keys.add(key)
+                                if key in completed_keys:
+                                    continue
+                                if self._generate_for_ranking(
                                     ranking_strategy=ranking_strategy,
                                     metric="content_event_topic_kw",
                                     trace_metric=trace_metric,
@@ -1647,13 +1913,20 @@ class AnswerGenerator:
                                     gold=gold,
                                     targets=targets,
                                     category=category,
-                                    writer=writer_obj,
                                     out_jsonl=out_path,
                                     topn=topn,
-                                )
+                                ):
+                                    completed_keys.add(key)
 
-        csv_base_file.close()
-        self._write_summary()
+        for store in self.embedding_stores.values():
+            store.flush()
+        missing_keys = expected_keys - completed_keys
+        if missing_keys:
+            logger.warning("⚠️ Summary skipped because generation is incomplete: missing %s/%s requested rows", len(missing_keys), len(expected_keys))
+            for key in list(sorted(missing_keys))[:10]:
+                logger.warning("⚠️ Missing generation key: %s", key)
+        else:
+            self._write_summary()
         logger.info("✅ Generation complete")
 def _announce_outputs(stage: str, paths: List[str]):
     targets = [p for p in paths if p]
@@ -1677,8 +1950,12 @@ def main():
         help="Text modes for generation; default content only",
     )
     parser.add_argument("--run-id", type=str, help="Run identifier (defaults to model name)")
+    parser.add_argument("--model", type=str, default=Config.LLM_MODEL, help="Chat completion model to use")
+    parser.add_argument("--trace-event-topn", type=str, default=str(Config.TRACE_EVENT_TOP_N), help="Number of box events to use as trace seeds by question similarity, or 'all'")
     args = parser.parse_args()
 
+    Config.LLM_MODEL = args.model
+    Config.TRACE_EVENT_TOP_N = args.trace_event_topn
     Config.apply_run_id(args.run_id)
     Config.BUILD_PREV_MSGS = max(1, args.build_prev_msgs)
     Config.TOP_K_RETRIEVE = None  # Keep full ranking
@@ -1720,7 +1997,7 @@ def main():
         retr.run(Config.SIMPLE_RETRIEVAL_JSONL, Config.SIMPLE_RETRIEVAL_CSV)
 
     if args.stage in ("generate", "all"):
-        _announce_outputs("generate", [Config.GENERATION_RESULT_FILE, Config.GENERATION_REPORT_CSV, Config.GEN_SUMMARY_FILE, Config.TOKEN_LOG_FILE])
+        _announce_outputs("generate", [Config.GENERATION_RESULT_FILE, Config.GEN_SUMMARY_FILE, Config.TOKEN_LOG_FILE, Config.API_RETRY_LOG_FILE])
 
         if needs_trace and not os.path.exists(Config.TIME_TRACE_FILE):
             logger.warning("Trace file missing but trace text_mode requested; run trace stage first.")
@@ -1730,11 +2007,11 @@ def main():
             answer_topn=topn_list,
             text_modes=text_modes,
             stage_label="gen",
+            trace_event_topn=Config.TRACE_EVENT_TOP_N,
         )
         generator.run(
             Config.SIMPLE_RETRIEVAL_JSONL,
             Config.GENERATION_RESULT_FILE,
-            Config.GENERATION_REPORT_CSV,
         )
 
 
