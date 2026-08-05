@@ -1,5 +1,13 @@
 # MemBox: Weaving Topic Continuity into Long-Range Memory for LLM Agents
 
+## Agent Memory Leaderboard Deployment
+
+For Agent Memory Leaderboard maintainer deployment, use the
+`leaderboard-add-search-service` branch and follow
+[`README_LEADERBOARD.md`](README_LEADERBOARD.md). That branch exposes MemBox as
+a Dockerized synchronous Add/Search service and does not require author-hosted
+endpoints or private credentials.
+
 ## Introduction
 
 MemBox is a memory architecture for long-range conversational memory in LLM agents. It is built around topic continuity: instead of storing isolated chunks and relying only on nearest-neighbor retrieval at question time, MemBox first builds coherent memory boxes and then links them with event-level traces that preserve temporal, causal, and thematic structure.

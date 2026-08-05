@@ -10,7 +10,6 @@ from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 
-import tiktoken
 from openai import OpenAI
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -289,6 +288,7 @@ Answer:"""
         cls.BUILD_TRACE_FILE = os.path.join(cls.OUTPUT_DIR, "trace_build_process.jsonl")
         cls.TIME_TRACE_FILE = os.path.join(cls.OUTPUT_DIR, "time_traces.jsonl")
         cls.TRACE_PROMPT_LOG_FILE = os.path.join(cls.OUTPUT_DIR, "trace_prompts.jsonl")
+        cls.TRACE_STATS_FILE = os.path.join(cls.OUTPUT_DIR, "trace_stats.jsonl")
         cls.BUILD_STATS_FILE = os.path.join(cls.OUTPUT_DIR, "build_stats.jsonl")
         cls.GEN_SUMMARY_FILE = os.path.join(cls.OUTPUT_DIR, "generation_metrics_summary.jsonl")
         cls.API_RETRY_LOG_FILE = os.path.join(cls.OUTPUT_DIR, "api_retries.jsonl")
@@ -305,6 +305,11 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+class DisabledTokenEncoding:
+    def encode(self, text: str) -> List[int]:
+        return []
+
+
 # ================= 2. 基础服务类 =================
 class TraceLogger:
     @staticmethod
@@ -318,27 +323,7 @@ class TokenAnalyzer:
 
     @staticmethod
     def log_usage(usage, note, extra=None):
-        if not usage:
-            return
-        stage = None
-        if extra and "stage" in extra:
-            stage = extra["stage"]
-        entry = {
-            "ts": datetime.now().strftime("%H:%M:%S"),
-            "note": note,
-            "in": usage.prompt_tokens,
-            "out": getattr(usage, "completion_tokens", 0),
-        }
-        if extra:
-            entry.update(extra)
-        with open(Config.TOKEN_LOG_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-        if stage:
-            stats = TokenAnalyzer.stage_stats[stage]
-            stats["calls"] += 1
-            stats["prompt"] += usage.prompt_tokens
-            stats["completion"] += getattr(usage, "completion_tokens", 0)
-            stats["total"] += getattr(usage, "total_tokens", usage.prompt_tokens + getattr(usage, "completion_tokens", 0))
+        return
 
     @staticmethod
     def get_stage_stats(stage: str) -> Dict[str, float]:
@@ -423,6 +408,8 @@ class EmbeddingStore:
 
 
 class LLMWorker:
+    LOCAL_CHAR_EMBEDDING_MODELS = {"local-char", "char", "char-match", "mock-char"}
+
     def __init__(self):
         self.client = OpenAI(
             base_url=Config.BASE_URL,
@@ -430,10 +417,39 @@ class LLMWorker:
             timeout=Config.API_TIMEOUT_SECONDS,
             max_retries=0,
         )
-        self.encoding = tiktoken.encoding_for_model(Config.LLM_MODEL)
+        self.encoding = DisabledTokenEncoding()
 
     def count_tokens(self, text: str) -> int:
-        return len(self.encoding.encode(text or ""))
+        return 0
+
+    @classmethod
+    def _use_local_char_embedding(cls) -> bool:
+        return str(Config.EMBEDDING_MODEL or "").strip().lower() in cls.LOCAL_CHAR_EMBEDDING_MODELS
+
+    @staticmethod
+    def _local_char_embedding(text: str, dims: int = 512) -> List[float]:
+        normalized = re.sub(r"\s+", " ", str(text or "").lower()).strip()
+        vec = [0.0] * dims
+        if not normalized:
+            return vec
+
+        def add_feature(feature: str, weight: float) -> None:
+            digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(digest, "big") % dims
+            vec[idx] += weight
+
+        compact = re.sub(r"\s+", "", normalized)
+        for ch in compact:
+            add_feature(f"c:{ch}", 1.0)
+        for n, weight in ((2, 1.5), (3, 2.0)):
+            if len(compact) < n:
+                continue
+            for i in range(len(compact) - n + 1):
+                add_feature(f"{n}:{compact[i:i+n]}", weight)
+
+        for token in re.findall(r"[a-z0-9]+", normalized):
+            add_feature(f"w:{token}", 2.0)
+        return vec
 
     def _log_api_retry(self, kind: str, note: str, attempt: int, elapsed: float, error: Exception, will_retry: bool):
         entry = {
@@ -477,6 +493,8 @@ class LLMWorker:
                 time.sleep(min(2.0, 0.5 * attempt))
 
     def get_embedding(self, text, note="Emb"):
+        if self._use_local_char_embedding():
+            return self._local_char_embedding(text)
         try:
             if not text:
                 return [0.0] * 1536
@@ -1286,7 +1304,7 @@ class AnswerGenerator:
         self.text_modes = text_modes or Config.GEN_TEXT_MODES
         self.trace_metrics = Config.TRACE_METRICS
         self.trace_event_topn = trace_event_topn if trace_event_topn is not None else Config.TRACE_EVENT_TOP_N
-        self.encoding = tiktoken.encoding_for_model(Config.LLM_MODEL)
+        self.encoding = DisabledTokenEncoding()
         self.box_map: Dict[int, Dict[int, str]] = {}
         self.box_events: Dict[int, Dict[int, List[str]]] = {}
         self.qa_map: Dict[int, List[Dict[str, Any]]] = {}
